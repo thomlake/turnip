@@ -1,20 +1,21 @@
 """Turnip: simple framework for orchestrating LLM experiments."""
 
-from .processor import TurnProcessor
+from .runner import ConversationRunner
 from .providers import (
     LLMProvider,
     OpenAIProvider,
     TogetherProvider,
     VLLMProvider,
 )
-from .storage import ResultStore, LLMResult
+from .storage import ResultStore, LLMResult, LLMResponse
 
 __all__ = [
-    "TurnProcessor",
+    "ConversationRunner",
     "LLMProvider",
     "OpenAIProvider",
     "TogetherProvider",
     "VLLMProvider",
     "ResultStore",
     "LLMResult",
+    "LLMResponse",
 ]
