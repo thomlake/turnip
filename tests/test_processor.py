@@ -4,20 +4,22 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from turnip import TurnProcessor
+from turnip import ConversationRunner
 from turnip.providers.base import LLMProvider
+from turnip.storage import LLMResponse
 
 
 class DummyProvider(LLMProvider):
     def __init__(self):
         self.calls = 0
 
-    async def completion(self, prompt: str, **kwargs: object) -> str:
+    async def completion(self, messages, **kwargs: object) -> LLMResponse:
         self.calls += 1
-        return prompt + " response"
+        prompt = messages[-1]["content"]
+        return LLMResponse(messages=messages, content=prompt + " response")
 
 
-class EchoProcessor(TurnProcessor):
+class EchoProcessor(ConversationRunner):
     def render_prompt(self, state):
         return state
 
