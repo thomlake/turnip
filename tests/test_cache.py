@@ -6,7 +6,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from turnip import ConversationRunner
 from turnip.providers.base import LLMProvider
-from turnip.storage import LLMResult, LLMResponse
+from turnip.storage import (
+    LLMResponse,
+    MemoryCacheStore,
+    MemoryResultStore,
+)
 
 
 class DummyProvider(LLMProvider):
@@ -19,17 +23,6 @@ class DummyProvider(LLMProvider):
         return LLMResponse(messages=messages, content=prompt + " response")
 
 
-class MemoryStore:
-    def __init__(self):
-        self.data = {}
-
-    async def fetch(self, experiment, run, instance):
-        key = (experiment, run, instance)
-        return self.data.get(key)
-
-    async def insert(self, result):
-        key = (result.experiment, result.run, result.instance)
-        self.data[key] = result
 
 
 class EchoProcessor(ConversationRunner):
@@ -45,10 +38,15 @@ class EchoProcessor(ConversationRunner):
 
 async def run():
     provider = DummyProvider()
-    store = MemoryStore()
-    proc = EchoProcessor(provider, store)
-    result1 = await proc.process("hello", experiment="exp", run="run1", instance="id")
-    result2 = await proc.process("hello", experiment="exp", run="run1", instance="id")
+    store = MemoryResultStore()
+    cache = MemoryCacheStore()
+    proc = EchoProcessor(provider, store=store, cache=cache)
+    result1 = await proc.process(
+        "hello", project="proj", experiment="exp", run="run1", instance="id"
+    )
+    result2 = await proc.process(
+        "hello", project="proj", experiment="exp", run="run1", instance="id"
+    )
     assert result1 == result2 == "hello response"
     assert provider.calls == 1
 
