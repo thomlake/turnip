@@ -3,13 +3,14 @@ import contextvars
 import functools
 import inspect
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Generic, Iterable, Literal, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Generic, Iterable, Literal, Optional, Sequence, TypeVar, Union, cast, overload
 
-from .storage import Context, normalize_key
-from .types import JsonDict, Key, P, R, T
+from turnip.storage import Context, normalize_key
+from turnip.types import JsonDict, Key, P, R, T
 
 _current_rep: contextvars.ContextVar[int] = contextvars.ContextVar("turnip_program_current_rep", default=0)
 _current_key: contextvars.ContextVar[Key | None] = contextvars.ContextVar("turnip_program_current_key", default=None)
+StepFn = TypeVar("StepFn", bound=Callable[..., Awaitable[JsonDict]])
 
 
 @dataclass(frozen=True)
@@ -49,13 +50,13 @@ class Trials(Generic[T]):
             yield r, self.keys_by_rep[r], self.items_by_rep[r]
 
 
-def step(name: str | None = None):
+def _step_decorator(name: str | None = None) -> Callable[[StepFn], StepFn]:
     """
     Decorate an async Program method to be cached as a step.
     The wrapped method returns a JsonDict.
     """
 
-    def deco(fn: Callable[..., Awaitable[JsonDict]]):
+    def deco(fn: StepFn) -> StepFn:
         if not inspect.iscoroutinefunction(fn):
             raise TypeError("@step can only decorate async functions")
 
@@ -77,9 +78,27 @@ def step(name: str | None = None):
             return await ctx.run_cached(step_id=step_id, key=key, rep=rep, fn=call)
 
         wrapper.__step_name__ = step_name  # type: ignore[attr-defined]
-        return wrapper
+        return cast(StepFn, wrapper)
 
     return deco
+
+
+@overload
+def step(fn: StepFn) -> StepFn: ...
+
+
+@overload
+def step(name: str) -> Callable[[StepFn], StepFn]: ...
+
+
+def step(name: str | StepFn) -> StepFn | Callable[[StepFn], StepFn]:
+    if callable(name):
+        return _step_decorator()(name)
+
+    if isinstance(name, str):
+        return _step_decorator(name)
+
+    raise TypeError("@step expects an async function or an optional step name string")
 
 
 class Program(Generic[P, R]):

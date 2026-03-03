@@ -10,7 +10,7 @@ class OneStepProgram(Program[dict, dict]):
     def key(self, item: dict) -> str:
         return str(item["id"])
 
-    @step()
+    @step
     async def enrich(self, item: dict) -> dict:
         base = item.get("id", item.get("value"))
         if base is None:
@@ -32,6 +32,21 @@ def _fetch_records(db_path: Path):
             """
         ).fetchall()
         return rows
+    finally:
+        conn.close()
+
+
+def _fetch_steps(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT step
+            FROM records
+            ORDER BY step
+            """
+        ).fetchall()
+        return [row[0] for row in rows]
     finally:
         conn.close()
 
@@ -90,6 +105,40 @@ def test_resume_success_skips_and_error_retries(tmp_path: Path):
     assert rows == [("k1", 0, "success", 2, '{"ok": true}', None)]
 
 
+def test_step_decorator_supports_bare_and_named_forms(tmp_path: Path):
+    db_path = tmp_path / "runs.db"
+    ctx = Store(str(db_path)).experiment("exp_step_forms", config={}).bind(namespace="ns")
+
+    class DecoratorFormsProgram(Program[dict, dict]):
+        def key(self, item: dict) -> str:
+            return str(item["id"])
+
+        @step
+        async def plain(self, item: dict) -> dict:
+            return {"plain": item["id"]}
+
+        @step("custom")
+        async def named(self, item: dict) -> dict:
+            return {"named": item["id"]}
+
+        async def run(self, item: dict) -> dict:
+            left = await self.plain(item)
+            right = await self.named(item)
+            return {**left, **right}
+
+    prog = DecoratorFormsProgram(ctx)
+
+    async def main():
+        trials = await prog.apply([{"id": 1}])
+        assert trials.rep(0) == [{"plain": 1, "named": 1}]
+
+    asyncio.run(main())
+
+    assert prog.plain.__step_name__ == "plain"  # type: ignore[attr-defined]
+    assert prog.named.__step_name__ == "custom"  # type: ignore[attr-defined]
+    assert _fetch_steps(db_path) == ["custom", "plain"]
+
+
 def test_program_apply_sequence_and_batch_rep_mapping(tmp_path: Path):
     db_path = tmp_path / "runs.db"
     ctx = Store(str(db_path)).experiment("exp3", config={}).bind(namespace="ns")
@@ -125,7 +174,7 @@ def test_apply_collect_returns_outcome_without_raising(tmp_path: Path):
         def key(self, item: dict) -> str:
             return str(item["id"])
 
-        @step()
+        @step
         async def risky(self, item: dict) -> dict:
             if item.get("fail"):
                 raise RuntimeError("bad")
@@ -166,7 +215,7 @@ def test_batch_key_isolation_under_concurrency(tmp_path: Path):
             # Intentionally different from trials key override path.
             return f"id-{item['id']}"
 
-        @step()
+        @step
         async def record(self, item: dict) -> dict:
             return {"id": item["id"]}
 

@@ -47,7 +47,7 @@ You implement:
 
 * `key(item)` → stable identity
 * `run(item)` → orchestration logic
-* `@step` methods → cached units returning JSON-serializable dicts
+* `@step` methods → cached units returning JSON-serializable dicts (`@step`, `@step()`, or `@step("name")`)
 
 ```python
 from turnip import Program, step
@@ -57,7 +57,7 @@ class ScoreUserItem(Program[dict, dict]):
     def key(self, item: dict) -> str:
         return (item["user_id"], item["item_id"])
 
-    @step()
+    @step
     async def score(self, item: dict) -> dict:
         return {"score": 0.87, "rationale": "..."}
 
@@ -256,7 +256,7 @@ from turnip import Program, Store, step
 class Describe(Program[dict, dict]):
     def key(self, item): return item["id"]
 
-    @step()
+    @step("describe")
     async def describe(self, item):
         return {"desc": f"desc({item['id']})"}
 
