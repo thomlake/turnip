@@ -1,11 +1,19 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
-[project]
+[tool.poetry]
 name = "turnip"
 version = "0.1.0"
-description = "LLM orchestration utilities"
+description = "Lightweight storage and execution framework for LLM-style experiments."
+authors = ["Turnip Contributors"]
 readme = "README.md"
-requires-python = ">=3.10"
-authors = [{name = "Turnip Team"}]
+packages = [{ include = "turnip", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+aiosqlite = ">=0.20.0,<1.0.0"
+openai = ">=1.0.0,<3.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0.0,<9.0.0"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
