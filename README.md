@@ -1,310 +1,138 @@
-# Turnip 🫜
+# turnip 🫜
 
-A lightweight storage and execution framework for LLM-style experiments.
+Async runtime for define-by-run LLM agent experiments.
 
-Turnip provides:
+## Features
 
-* Persistent caching of step-level results
-* Automatic resume semantics
-* First-class repetition (`rep`) support
-* Async concurrent execution with concurrency control
-* SQLite-backed storage (WAL enabled)
-* Minimal abstraction surface (no DAG engine, no heavy framework)
+- Async dataset execution via `Program.map(...)`
+- Scope-level persistence with `@scope` (SQLite)
+- Resume support: reruns skip successful calls and retry failed/missing ones
+- High-level identifiers: `experiment`, `stage`, `key`, `trial`
+- Low-level identifiers: deterministic scoped call paths (trace-like)
 
-It is designed for iterative LLM / agent workflows where:
+## Install
 
-* Each item has a stable identity (`key`)
-* Work is structured into cached steps
-* Experiments may be repeated for variance
-* You want reproducibility without orchestration overhead
+This repo uses Poetry:
 
----
+```bash
+poetry install
+```
 
-# Core Concepts
-
-## Experiment
-
-An experiment is a named run with associated configuration.
+## Quickstart
 
 ```python
-from turnip import Store
+from turnip import Program, scope
 
-store = Store("runs.db")
-exp = store.experiment("run_2026_03_03_001", config={"model": "gpt-5"})
-ctx = exp.bind(namespace="baseline")
+
+@scope
+async def call_sim_user(messages: list[dict]) -> dict:
+    # call your robust LLM client here
+    return {"role": "user", "content": "simulated user reply"}
+
+
+@scope
+async def call_assistant(messages: list[dict]) -> dict:
+    # call your robust LLM client here
+    return {"role": "assistant", "content": "assistant reply"}
+
+
+async def run_user_simulation(item: dict, turns: int = 1) -> dict:
+    sim_user_messages = [{"role": "system", "content": item["user_system"]}]
+    assistant_messages = [
+        {"role": "system", "content": item["assistant_system"]},
+        {"role": "user", "content": item["sim_user_seed"]},
+    ]
+
+    for _ in range(turns):
+        assistant_message = await call_assistant(assistant_messages)
+        assistant_messages.append(assistant_message)
+
+        sim_user_messages.append({"role": "user", "content": assistant_message["content"]})
+        user_message = await call_sim_user(sim_user_messages)
+        sim_user_messages.append(user_message)
+
+    return {"user": sim_user_messages, "assistant": assistant_messages}
+
+
+async def main(items: list[dict]) -> list[dict]:
+    program = Program(experiment="demo", config={"model": "gpt-5"})
+    return await program.map(
+        run_user_simulation,
+        items,
+        key="id",
+        repeat=1,
+        max_concurrency=32,
+    )
 ```
 
-* Configuration is stored once per experiment.
-* All records are scoped to `(experiment, step_id, key, rep)`.
+## Core API
 
----
-
-## Program
-
-A `Program` defines a per-item computation.
-
-You implement:
-
-* `key(item)` → stable identity
-* `run(item)` → orchestration logic
-* `@step` methods → cached units returning JSON-serializable dicts (`@step`, `@step()`, or `@step("name")`)
+### `Program`
 
 ```python
-from turnip import Program, step
-
-class ScoreUserItem(Program[dict, dict]):
-
-    def key(self, item: dict) -> str:
-        return (item["user_id"], item["item_id"])
-
-    @step
-    async def score(self, item: dict) -> dict:
-        return {"score": 0.87, "rationale": "..."}
-
-    async def run(self, item: dict) -> dict:
-        s = await self.score(item)
-        return {"user_id": item["user_id"], **s}
+Program(experiment: str, config: dict[str, Any], *, db_path: str | Path | None = None)
 ```
 
----
+- `experiment`: experiment name
+- `config`: stored as JSON in the experiment database
+- `db_path`: defaults to `.turnip/experiments/{experiment}.sqlite3`
 
-## Step Caching
+### `Program.map`
 
-Each `@step` method is cached under:
-
+```python
+await Program.map(
+    fn,
+    items,
+    *,
+    repeat: int = 1,
+    stage: str | None = None,
+    key: str | Callable[[dict[str, Any]], str],
+    max_concurrency: int = 32,
+)
 ```
-(experiment, namespace, program_name, step_name, key, rep)
-```
+
+- `repeat`: number of trials per input item (`trial` values are `0..repeat-1`)
+- `stage`: logical stage name (defaults to `fn.__name__`)
+- `key`: either item field name (like `"id"`) or extractor function
+- `max_concurrency`: async task fanout limit
+
+### `@scope`
+
+Decorate async functions whose outputs should be cached at scope level.
 
 Behavior:
 
-* If `status == success` → cached payload is returned
-* If `status == error` → step is retried
-* On success → payload overwrites previous record
-* On error → error + traceback are stored
+- Requires active `Program.map` context
+- On call, checks latest stored record for current `(experiment, stage, key, trial, scope)`
+- If latest status is success, returns cached JSON result
+- Otherwise executes function and stores either:
+  - success result JSON, or
+  - error metadata (type, message, traceback)
 
-Resume is automatic. Force requires explicit deletion (not implicit recompute).
+## Resume Semantics
 
----
+On rerun with the same `experiment + stage + key + trial`:
 
-## Repetition (`rep`)
+- successful scope calls are reused
+- failed or missing scope calls are re-executed
 
-Repetition is a first-class execution dimension.
+This allows interrupted/partially failed runs to complete without repeating finished work.
 
-```python
-trials = await program.apply(items, repeat=5)
+## Storage Model
+
+Each scope call records:
+
+- `experiment`, `stage`, `key`, `trial`
+- `scope` (deterministic path like `run_user_simulation[0]/call_assistant[0]`)
+- `status` (`success` or `error`)
+- `data_json` (for successes)
+- `exception_type`, `exception_message`, `traceback_text` (for errors)
+- timestamps and `attempt` counter
+
+## Development
+
+Run tests:
+
+```bash
+poetry run pytest -q
 ```
-
-This produces reps `0..4`.
-
-If you rerun with `repeat=5` and only `rep=0` exists, only `rep=1..4` will execute.
-
-Repetition is stored as a database column:
-
-```
-rep INTEGER NOT NULL DEFAULT 0
-```
-
----
-
-## Trials
-
-`apply()` returns `Trials`.
-
-`Trials` preserves repetition alignment and item identity.
-
-```python
-trials.repeat                # number of reps
-trials.rep(0)                # items for rep 0
-trials.iter_reps()           # iterate (rep, keys, items)
-```
-
-### Composition
-
-Aligned forwarding:
-
-```python
-b1 = await program1.apply(items, repeat=5)
-b2 = await program2.apply(b1)  # preserves rep alignment
-```
-
-Forward only rep 0:
-
-```python
-b2 = await program2.apply(b1.rep(0))
-```
-
-Cross product (explicit):
-
-```python
-b2 = await program2.apply(b1, repeat=3)
-```
-
----
-
-# Execution Model
-
-`Program.apply()`:
-
-* Supports `Sequence` or `Trials` input
-* Controls concurrency via semaphore
-* Threads `rep` via `ContextVar`
-* Handles error modes:
-
-  * `"raise"` (default)
-  * `"collect"` → returns `Outcome`
-
----
-
-# Storage
-
-SQLite backend (WAL enabled).
-
-Schema (simplified):
-
-```
-experiments(
-    experiment PRIMARY KEY,
-    created_at,
-    config_json
-)
-
-records(
-    experiment,
-    step_id,
-    namespace,
-    program,
-    step,
-    key,
-    rep,
-    status,
-    attempts,
-    payload_json,
-    error_type,
-    error_msg,
-    traceback,
-    duration_ms,
-    PRIMARY KEY (experiment, step_id, key, rep)
-)
-```
-
-Guarantees:
-
-* One canonical record per `(experiment, step_id, key, rep)`
-* Errors stored until overwritten by success
-* Attempts counter increments on each execution
-
----
-
-# Analysis
-
-Built-in helpers:
-
-```python
-df = await ctx.records_df(program="ScoreUserItem")
-errors = await ctx.errors_df()
-```
-
-Returns a pandas DataFrame with:
-
-* experiment
-* namespace
-* program
-* step
-* key
-* rep
-* status
-* payload_json
-* error fields
-* duration
-* attempts
-
-Payload remains JSON; caller can normalize as needed.
-
----
-
-# Design Philosophy
-
-Turnip intentionally avoids:
-
-* DAG schedulers
-* Graph inference
-* Magic orchestration
-* Framework-level abstractions
-
-Instead:
-
-* Orchestration is plain Python
-* Caching is step-scoped
-* Repetition is explicit
-* Composition is transparent
-
-This keeps the system:
-
-* Easy to reason about
-* Easy to debug
-* Easy to extend
-* Hard to accidentally over-abstract
-
----
-
-# Example
-
-```python
-from turnip import Program, Store, step
-
-class Describe(Program[dict, dict]):
-    def key(self, item): return item["id"]
-
-    @step("describe")
-    async def describe(self, item):
-        return {"desc": f"desc({item['id']})"}
-
-    async def run(self, item):
-        d = await self.describe(item)
-        return {**item, **d}
-
-
-async def main():
-    store = Store("runs.db")
-    ctx = store.experiment("demo", config={}).bind()
-
-    items = [{"id": "A"}, {"id": "B"}]
-
-    trials = await Describe(ctx).apply(items, repeat=3)
-    print(trials.rep(0))
-```
-
----
-
-# Dependencies
-
-* Python 3.11+
-* `aiosqlite`
-* `openai`
-* `pandas` (optional, for analysis helpers)
-
----
-
-# Roadmap (Possible Extensions)
-
-* Delete / force recompute APIs
-* Attempt-level history table
-* Step-level invalidation
-* Deterministic seed injection per rep
-* Persistent connection pooling
-* DuckDB backend
-
----
-
-# Why This Exists
-
-Turnip is designed for LLM/agent experiments where:
-
-* Outputs are JSON-like
-* Failures need to be inspectable
-* Resume must be automatic
-* Variance runs are common
-* Orchestration should remain explicit
-
-It provides just enough structure to make experimentation disciplined, without turning into a workflow engine.

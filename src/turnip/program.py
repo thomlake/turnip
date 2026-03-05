@@ -1,203 +1,104 @@
+from __future__ import annotations
+
 import asyncio
-import contextvars
-import functools
-import inspect
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Generic, Iterable, Literal, Optional, Sequence, TypeVar, Union, cast, overload
+import json
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any, TypeVar
 
-from turnip.storage import Context, normalize_key
-from turnip.types import JsonDict, Key, P, R, T
+from turnip.errors import FailedMapItem, MapExecutionError
+from turnip.scope import RunContext, reset_run_context, set_run_context
+from turnip.storage import ExperimentStorage
 
-_current_rep: contextvars.ContextVar[int] = contextvars.ContextVar("turnip_program_current_rep", default=0)
-_current_key: contextvars.ContextVar[Key | None] = contextvars.ContextVar("turnip_program_current_key", default=None)
-StepFn = TypeVar("StepFn", bound=Callable[..., Awaitable[JsonDict]])
+T = TypeVar("T")
 
 
-@dataclass(frozen=True)
-class Outcome(Generic[T]):
-    ok: bool
-    value: Optional[T] = None
-    error: Optional[str] = None
+def _default_db_path(experiment: str) -> Path:
+    return Path(".turnip") / "experiments" / f"{experiment}.sqlite3"
 
 
-@dataclass(frozen=True)
-class Trials(Generic[T]):
-    """
-    Minimal repetition-aware container.
-    - repeat: number of reps in this trial set
-    - keys_by_rep[r][i] corresponds to items_by_rep[r][i]
-    """
+class Program:
+    def __init__(self, experiment: str, config: dict[str, Any], *, db_path: str | Path | None = None) -> None:
+        self.experiment = experiment
+        self.config = config
+        self.db_path = Path(db_path) if db_path is not None else _default_db_path(experiment)
 
-    repeat: int
-    keys_by_rep: list[list[Key]]
-    items_by_rep: list[list[T]]
-
-    def __post_init__(self) -> None:
-        if self.repeat != len(self.items_by_rep) or self.repeat != len(self.keys_by_rep):
-            raise ValueError("Trials repeat mismatch with keys/items dimensions.")
-        for r in range(self.repeat):
-            if len(self.keys_by_rep[r]) != len(self.items_by_rep[r]):
-                raise ValueError(f"Trials keys/items length mismatch at rep {r}.")
-
-    def rep(self, r: int) -> list[T]:
-        return self.items_by_rep[r]
-
-    def keys(self, r: int) -> list[Key]:
-        return self.keys_by_rep[r]
-
-    def iter_reps(self) -> Iterable[tuple[int, list[Key], list[T]]]:
-        for r in range(self.repeat):
-            yield r, self.keys_by_rep[r], self.items_by_rep[r]
-
-
-def _step_decorator(name: str | None = None) -> Callable[[StepFn], StepFn]:
-    """
-    Decorate an async Program method to be cached as a step.
-    The wrapped method returns a JsonDict.
-    """
-
-    def deco(fn: StepFn) -> StepFn:
-        if not inspect.iscoroutinefunction(fn):
-            raise TypeError("@step can only decorate async functions")
-
-        step_name = name or fn.__name__
-
-        @functools.wraps(fn)
-        async def wrapper(self: "Program[Any, Any]", item: Any, *args: Any, **kwargs: Any) -> JsonDict:
-            ctx = self.ctx
-            program_name = self.program_name or self.__class__.__name__
-            step_id = ctx.make_step_id(program_name, step_name)
-
-            rep = _current_rep.get()
-            key_override = _current_key.get()
-            key = key_override if key_override is not None else self.key(item)
-
-            async def call() -> JsonDict:
-                return await fn(self, item, *args, **kwargs)
-
-            return await ctx.run_cached(step_id=step_id, key=key, rep=rep, fn=call)
-
-        wrapper.__step_name__ = step_name  # type: ignore[attr-defined]
-        return cast(StepFn, wrapper)
-
-    return deco
-
-
-@overload
-def step(fn: StepFn) -> StepFn: ...
-
-
-@overload
-def step(name: str) -> Callable[[StepFn], StepFn]: ...
-
-
-def step(name: str | StepFn) -> StepFn | Callable[[StepFn], StepFn]:
-    if callable(name):
-        return _step_decorator()(name)
-
-    if isinstance(name, str):
-        return _step_decorator(name)
-
-    raise TypeError("@step expects an async function or an optional step name string")
-
-
-class Program(Generic[P, R]):
-    """
-    Per-item computation; cached steps are @step-decorated methods returning JsonDict.
-    Program.run() orchestrates steps and returns output R.
-    """
-
-    program_name: Optional[str] = None
-
-    def __init__(self, ctx: Context):
-        self.ctx = ctx
-
-    def key(self, item: P) -> Key:
-        raise NotImplementedError
-
-    async def run(self, item: P) -> R:
-        raise NotImplementedError
-
-    async def apply(
+    async def map(
         self,
-        items: Sequence[P] | Trials[P],
+        fn: Callable[[dict[str, Any]], Awaitable[T]],
+        items: list[dict[str, Any]],
         *,
         repeat: int = 1,
-        concurrency: int = 50,
-        on_error: Literal["raise", "collect"] = "raise",
-    ) -> Trials[Union[R, Outcome[R]]]:
-        if repeat < 1:
-            raise ValueError("repeat must be >= 1")
-        if concurrency < 1:
-            raise ValueError("concurrency must be >= 1")
+        stage: str | None = None,
+        key: str | Callable[[dict[str, Any]], str],
+        max_concurrency: int = 32,
+    ) -> list[T]:
+        if repeat <= 0:
+            raise ValueError("repeat must be > 0")
+        if max_concurrency <= 0:
+            raise ValueError("max_concurrency must be > 0")
 
-        sem = asyncio.Semaphore(concurrency)
+        stage_name = stage or fn.__name__
+        storage = ExperimentStorage(self.db_path)
+        await storage.connect()
+        await storage.upsert_experiment(self.experiment, json.dumps(self.config))
 
-        async def run_one(item: P, *, rep_id: int, key: Key) -> Union[R, Outcome[R]]:
-            rep_token = _current_rep.set(rep_id)
-            key_token = _current_key.set(key)
+        jobs: list[tuple[int, dict[str, Any], str, int]] = []
+        for i, item in enumerate(items):
+            item_key = self._extract_key(item, key)
+            for trial in range(repeat):
+                jobs.append((i, item, item_key, trial))
+
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def run_job(index: int, item: dict[str, Any], item_key: str, trial: int) -> tuple[int, str, int, T]:
+            context = RunContext(
+                experiment=self.experiment,
+                stage=stage_name,
+                key=item_key,
+                trial=trial,
+                storage=storage,
+            )
+            token = set_run_context(context)
+            context.stack.append(f"{fn.__name__}[0]")
             try:
-                async with sem:
-                    out = await self.run(item)
-                return out
-            except Exception as e:
-                if on_error == "raise":
-                    raise
-                return Outcome[R](ok=False, value=None, error=f"{type(e).__name__}: {e}")
+                async with semaphore:
+                    value = await fn(item)
+                return index, item_key, trial, value
             finally:
-                _current_key.reset(key_token)
-                _current_rep.reset(rep_token)
+                context.stack.pop()
+                reset_run_context(token)
 
-        if isinstance(items, Trials):
-            in_repeat = items.repeat
-            in_keys_by_rep = items.keys_by_rep
-            in_items_by_rep = items.items_by_rep
+        tasks = [asyncio.create_task(run_job(i, item, item_key, trial)) for i, item, item_key, trial in jobs]
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if repeat == 1:
-                out_repeat = in_repeat
-                out_groups: list[list[Union[R, Outcome[R]]]] = []
-                out_keys: list[list[Key]] = []
-                for in_r in range(in_repeat):
-                    tasks = [
-                        asyncio.create_task(
-                            run_one(
-                                in_items_by_rep[in_r][i],
-                                rep_id=in_r,
-                                key=in_keys_by_rep[in_r][i],
-                            )
-                        )
-                        for i in range(len(in_items_by_rep[in_r]))
-                    ]
-                    out = await asyncio.gather(*tasks)
-                    out_groups.append(list(out))
-                    out_keys.append(list(in_keys_by_rep[in_r]))
-                return Trials(repeat=out_repeat, keys_by_rep=out_keys, items_by_rep=out_groups)
+        failures: list[FailedMapItem] = []
+        ordered_results: list[T | None] = [None] * len(jobs)
 
-            out_repeat = in_repeat * repeat
-            out_groups = [[] for _ in range(out_repeat)]
-            out_keys = [[] for _ in range(out_repeat)]
-            for in_r in range(in_repeat):
-                for out_r in range(repeat):
-                    rep_id = in_r * repeat + out_r
-                    tasks = [
-                        asyncio.create_task(
-                            run_one(in_items_by_rep[in_r][i], rep_id=rep_id, key=in_keys_by_rep[in_r][i])
-                        )
-                        for i in range(len(in_items_by_rep[in_r]))
-                    ]
-                    out = await asyncio.gather(*tasks)
-                    out_groups[rep_id] = list(out)
-                    out_keys[rep_id] = list(in_keys_by_rep[in_r])
-            return Trials(repeat=out_repeat, keys_by_rep=out_keys, items_by_rep=out_groups)
+        for job_i, result in enumerate(task_results):
+            item_index, _, item_key, trial = jobs[job_i]
+            if isinstance(result, BaseException):
+                failures.append(FailedMapItem(index=item_index, key=item_key, trial=trial, error=result))
+            else:
+                ordered_results[job_i] = result[3]
 
-        keys = [normalize_key(self.key(item)) for item in items]
-        out_groups: list[list[Union[R, Outcome[R]]]] = []
-        out_keys: list[list[Key]] = []
+        await storage.close()
 
-        for rep_id in range(repeat):
-            tasks = [asyncio.create_task(run_one(items[i], rep_id=rep_id, key=keys[i])) for i in range(len(items))]
-            out = await asyncio.gather(*tasks)
-            out_groups.append(list(out))
-            out_keys.append(list(keys))
+        if failures:
+            raise MapExecutionError(stage_name, failures)
 
-        return Trials(repeat=repeat, keys_by_rep=out_keys, items_by_rep=out_groups)
+        return [r for r in ordered_results if r is not None]
+
+    @staticmethod
+    def _extract_key(item: dict[str, Any], key: str | Callable[[dict[str, Any]], str]) -> str:
+        if isinstance(key, str):
+            if key not in item:
+                raise KeyError(f"item is missing key field '{key}'")
+            value = item[key]
+        else:
+            value = key(item)
+
+        if value is None:
+            raise ValueError("derived key cannot be None")
+
+        return str(value)
