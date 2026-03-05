@@ -26,13 +26,11 @@ from turnip import Program, scope
 
 @scope
 async def call_sim_user(messages: list[dict]) -> dict:
-    # call your robust LLM client here
     return {"role": "user", "content": "simulated user reply"}
 
 
 @scope
 async def call_assistant(messages: list[dict]) -> dict:
-    # call your robust LLM client here
     return {"role": "assistant", "content": "assistant reply"}
 
 
